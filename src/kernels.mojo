@@ -1,10 +1,10 @@
 """C ABI kernels for implicit-feedback matrix factorization."""
 
-from std.algorithm import parallelize
 from std.atomic import Atomic
 from std.builtin._startup import _ensure_runtime_init
 from std.math import exp, sqrt
 from std.sys import simd_width_of as simdwidthof
+from max.algorithm import parallelize
 
 comptime W = simdwidthof[DType.float64]()
 comptime Ptr = UnsafePointer[Float64, AnyOrigin[mut=True]]
@@ -400,12 +400,12 @@ def bpr_apply(
 def acquire_lock(lock: IPtr):
     while True:
         var expected = Int64(0)
-        if Atomic[DType.int64].compare_exchange(lock, expected, Int64(1)):
+        if Atomic[Int64].compare_exchange(lock, expected, Int64(1)):
             return
 
 
 def release_lock(lock: IPtr):
-    Atomic[DType.int64].store(lock, Int64(0))
+    Atomic[Int64].store(lock, Int64(0))
 
 
 def bpr_parallel(
