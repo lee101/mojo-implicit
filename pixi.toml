@@ -16,7 +16,7 @@ OPENBLAS_NUM_THREADS = "1"
 MKL_NUM_THREADS = "1"
 
 [dependencies]
-mojo = "==1.1.0.dev2026081105"
+mojo = "==1.2.0.dev2026092605"
 max-core = "==26.6.0.dev2026081105"
 python = "3.13.*"
 pytest = "*"

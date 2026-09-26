@@ -1,10 +1,8 @@
 """C ABI kernels for implicit-feedback matrix factorization."""
 
 from std.atomic import Atomic
-from std.builtin._startup import _ensure_runtime_init
 from std.math import exp, sqrt
 from std.sys import simd_width_of as simdwidthof
-from max.algorithm import parallelize
 
 comptime W = simdwidthof[DType.float64]()
 comptime Ptr = UnsafePointer[Float64, AnyOrigin[mut=True]]
@@ -202,74 +200,27 @@ def solve_row(
     return True
 
 
-def least_squares_parallel(
-    indptr: IPtr,
-    indices: IPtr,
-    data: Ptr,
-    result: Ptr,
-    fixed: Ptr,
-    gram: Ptr,
-    matrix_work: Ptr,
-    vector_work: Ptr,
-    failure_work: IPtr,
-    rows: Int,
-    n_factors: Int,
-    workers: Int,
-    regularization: Float64,
-) -> Int:
-    for worker in range(workers):
-        failure_work[worker] = 0
-
-    @parameter
-    def run_worker(worker: Int):
-        var worker_matrix = matrix_work + worker * n_factors * n_factors
-        var worker_vector = vector_work + worker * n_factors
-        var row = worker
-        while row < rows:
-            if not solve_row(
-                indptr,
-                indices,
-                data,
-                result,
-                fixed,
-                gram,
-                worker_matrix,
-                worker_vector,
-                row,
-                n_factors,
-                regularization,
-            ):
-                failure_work[worker] = Int64(row + 1)
-                return
-            row += workers
-
-    parallelize[run_worker](workers)
-    var first_failure = rows + 1
-    for worker in range(workers):
-        if (
-            failure_work[worker] != 0
-            and Int(failure_work[worker]) < first_failure
-        ):
-            first_failure = Int(failure_work[worker])
-    return 0 if first_failure == rows + 1 else first_failure
-
-
-@export("mi_least_squares")
-def mi_least_squares(
+@export("mi_least_squares_range")
+def mi_least_squares_range(
     indptr_addr: Int,
     indices_addr: Int,
     data_addr: Int,
     factors_addr: Int,
     fixed_addr: Int,
     gram_addr: Int,
+    row0: Int,
+    row1: Int,
     matrix_work_addr: Int,
     vector_work_addr: Int,
-    failure_work_addr: Int,
-    rows: Int,
     n_factors: Int,
-    workers: Int,
     regularization: Float64,
 ) abi("C") -> Int:
+    """Solve ALS rows [row0, row1); the shim fans this out across threads.
+
+    Each ALS row is an independent regularised normal-equation solve, so the
+    rows partition cleanly and the result does not depend on the split. Returns
+    zero, or the one-based index of the first row whose Cholesky failed.
+    """
     var indptr = ip(indptr_addr)
     var indices = ip(indices_addr)
     var data = fp(data_addr)
@@ -278,27 +229,7 @@ def mi_least_squares(
     var gram = fp(gram_addr)
     var matrix_work = fp(matrix_work_addr)
     var vector_work = fp(vector_work_addr)
-    var failure_work = ip(failure_work_addr)
-
-    if workers > 1:
-        _ensure_runtime_init()
-        return least_squares_parallel(
-            indptr,
-            indices,
-            data,
-            result,
-            fixed,
-            gram,
-            matrix_work,
-            vector_work,
-            failure_work,
-            rows,
-            n_factors,
-            workers,
-            regularization,
-        )
-
-    for row in range(rows):
+    for row in range(row0, row1):
         if not solve_row(
             indptr,
             indices,
@@ -408,7 +339,7 @@ def release_lock(lock: IPtr):
     Atomic[Int64].store(lock, Int64(0))
 
 
-def bpr_parallel(
+def bpr_worker_slices(
     userids: IPtr,
     itemids: IPtr,
     indptr: IPtr,
@@ -427,9 +358,11 @@ def bpr_parallel(
     verify_negative: Int,
 ) -> Int:
     var width = factors + 1
-
-    @parameter
-    def run_worker(worker: Int):
+    # Each sample holds up to three spin locks around a handful of fused
+    # multiply-adds, so the update is synchronisation bound rather than compute
+    # bound. The worker slices are walked in order, which is also the order the
+    # samples were generated in, so the factors match a single-threaded pass.
+    for worker in range(workers):
         var start = samples * worker // workers
         var end = samples * (worker + 1) // workers
         var correct = 0
@@ -466,8 +399,6 @@ def bpr_parallel(
             release_lock(locks + user_id)
         counts[worker] = Int64(correct)
         counts[workers + worker] = Int64(skipped)
-
-    parallelize[run_worker](workers)
     var total_correct = 0
     for worker in range(workers):
         total_correct += Int(counts[worker])
@@ -504,127 +435,65 @@ def mi_bpr_update(
     var skipped = ip(skipped_addr)
     var locks = ip(locks_addr)
     var counts = ip(counts_addr)
-    var width = factors + 1
-    var correct = 0
     skipped[0] = 0
-
-    if workers > 1:
-        _ensure_runtime_init()
-        var total_correct = bpr_parallel(
-            userids,
-            itemids,
-            indptr,
-            liked_samples,
-            disliked_samples,
-            users,
-            items,
-            locks,
-            counts,
-            samples,
-            factors,
-            user_count,
-            workers,
-            learning_rate,
-            regularization,
-            verify_negative,
-        )
-        for worker in range(workers):
-            skipped[0] += counts[workers + worker]
-        return total_correct
-
-    for sample in range(samples):
-        var liked_index = Int(liked_samples[sample])
-        var disliked_index = Int(disliked_samples[sample])
-        var user_id = Int(userids[liked_index])
-        var liked_id = Int(itemids[liked_index])
-        var disliked_id = Int(itemids[disliked_index])
-        if verify_negative != 0 and contains(
-            indptr, itemids, user_id, Int64(disliked_id)
-        ):
-            skipped[0] += 1
-            continue
-        if bpr_apply(
-            users + user_id * width,
-            items + liked_id * width,
-            items + disliked_id * width,
-            factors,
-            learning_rate,
-            regularization,
-        ):
-            correct += 1
-    return correct
+    var total_correct = bpr_worker_slices(
+        userids,
+        itemids,
+        indptr,
+        liked_samples,
+        disliked_samples,
+        users,
+        items,
+        locks,
+        counts,
+        samples,
+        factors,
+        user_count,
+        workers,
+        learning_rate,
+        regularization,
+        verify_negative,
+    )
+    for worker in range(workers):
+        skipped[0] += counts[workers + worker]
+    return total_correct
 
 
-def score_parallel(
-    queries: Ptr,
-    candidates: Ptr,
-    candidate_ids: IPtr,
-    dst: Ptr,
-    query_count: Int,
-    candidate_count: Int,
-    factors: Int,
-    workers: Int,
-):
-    var total = query_count * candidate_count
-
-    @parameter
-    def run_worker(worker: Int):
-        var pos = total * worker // workers
-        var end = total * (worker + 1) // workers
-        if pos == end:
-            return
-        var q = pos // candidate_count
-        var c = pos - q * candidate_count
-        while pos < end:
-            var candidate = Int(candidate_ids[c])
-            dst[pos] = dot(
-                queries + q * factors,
-                candidates + candidate * factors,
-                factors,
-            )
-            pos += 1
-            c += 1
-            if c == candidate_count:
-                c = 0
-                q += 1
-
-    parallelize[run_worker](workers)
 
 
-@export("mi_score")
-def mi_score(
+@export("mi_score_range")
+def mi_score_range(
     queries_addr: Int,
     candidates_addr: Int,
     candidate_ids_addr: Int,
     dst_addr: Int,
-    query_count: Int,
     candidate_count: Int,
     factors: Int,
-    workers: Int,
+    begin: Int,
+    end: Int,
 ) abi("C"):
+    """Score flattened positions [begin, end) of the query-by-candidate grid.
+
+    This is a dense dot-product sweep with no shared writes, so splitting the
+    output positions across threads leaves the values untouched.
+    """
     var queries = fp(queries_addr)
     var candidates = fp(candidates_addr)
     var candidate_ids = ip(candidate_ids_addr)
     var dst = fp(dst_addr)
-    var total = query_count * candidate_count
-    if workers > 1:
-        _ensure_runtime_init()
-        score_parallel(
-            queries,
-            candidates,
-            candidate_ids,
-            dst,
-            query_count,
-            candidate_count,
-            factors,
-            workers,
-        )
+    if end <= begin or candidate_count <= 0:
         return
-    for q in range(query_count):
-        for c in range(candidate_count):
-            var candidate = Int(candidate_ids[c])
-            dst[q * candidate_count + c] = dot(
-                queries + q * factors,
-                candidates + candidate * factors,
-                factors,
-            )
+    var pos = begin
+    var q = pos // candidate_count
+    var c = pos - q * candidate_count
+    while pos < end:
+        dst[pos] = dot(
+            queries + q * factors,
+            candidates + Int(candidate_ids[c]) * factors,
+            factors,
+        )
+        pos += 1
+        c += 1
+        if c == candidate_count:
+            c = 0
+            q += 1

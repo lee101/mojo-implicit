@@ -28,8 +28,11 @@ Not implemented:
 
 - CUDA/GPU models, logistic matrix factorization, item-item nearest-neighbor
   recommenders, approximate-nearest-neighbor adapters, and evaluation helpers.
-- OpenMP training. Large ALS, BPR, and scoring jobs use Mojo's CPU task runtime;
-  `num_threads` controls the available task count, and small jobs stay serial.
+- OpenMP training. ALS rows and the scoring grid are independent, so the Python
+  shim splits them into contiguous spans and runs them on a `ThreadPoolExecutor`
+  (at most eight workers); `num_threads` controls the span count and small jobs
+  stay serial. BPR stays serial: each sample takes three spin locks around a
+  handful of fused multiply-adds, so it is synchronisation bound.
 - Upstream's three-step conjugate-gradient ALS solver. `use_cg` and
   `use_native` are accepted, while this port always uses the more accurate
   Cholesky solve.
@@ -120,9 +123,11 @@ single Mojo compilation unit reconstructs mutable pointers using
 `AnyOrigin[mut=True]`.
 
 ALS builds each weighted normal equation from a shared factor Gram matrix and
-solves it in Mojo with an in-place Cholesky factorization. Independent rows use
-per-task scratch buffers above a launch threshold. BPR generates reproducible
-sample indices in NumPy; large updates run concurrently with ordered user/item
-row locks, while conflicting samples serialize safely. Recommendation and
-similarity calls use thresholded parallel SIMD scoring; Python handles sparse
-filters and stable top-N selection.
+solves it in Mojo with an in-place Cholesky factorization. `mi_least_squares_range`
+solves a contiguous row span with its own scratch buffers, and the shim fans the
+rows out across a thread pool; the result is bitwise identical to a serial pass
+because the rows never interact. BPR generates reproducible sample indices in
+NumPy; updates run in sample order under ordered user/item row locks, so the
+factors do not depend on the worker count. Recommendation and similarity calls
+use SIMD scoring over a flat position range that the shim splits across the same
+pool; Python handles sparse filters and stable top-N selection.

@@ -6,6 +6,7 @@ import ctypes
 import os
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -20,12 +21,16 @@ F = ctypes.c_double
 
 _SIGNATURES = {
     "mi_gram": ([I, I, I, I], None),
-    "mi_least_squares": ([I] * 12 + [F], I),
+    "mi_least_squares_range": ([I] * 11 + [F], I),
     "mi_bpr_update": ([I] * 14 + [F, F, I], I),
-    "mi_score": ([I] * 8, None),
+    "mi_score_range": ([I] * 8, None),
 }
 
 _PARALLEL_WORK_THRESHOLD = 100_000
+
+# The measured speedup curve for these kernels flattens past eight workers, and
+# every extra worker adds another thread to wake per call.
+_MAX_WORKERS = 8
 
 
 class BuildError(RuntimeError):
@@ -119,7 +124,51 @@ def worker_count(work_items: int, work: int, num_threads: int = 0) -> int:
             available = len(os.sched_getaffinity(0))
         except AttributeError:
             available = os.cpu_count() or 1
-    return max(1, min(work_items, available))
+    return max(1, min(work_items, available, _MAX_WORKERS))
+
+
+def _spans(total: int, parts: int) -> list[tuple[int, int]]:
+    """Split ``total`` work items into ``parts`` contiguous, near-equal spans."""
+    step = -(-total // parts)
+    return [
+        (lo, min(lo + step, total)) for lo in range(0, total, step) if lo < total
+    ]
+
+
+def _fan_out(function, arguments, total: int, workers: int, tail) -> list:
+    """Call ``function(*arguments, lo, hi, *tail)`` once per contiguous span."""
+    if workers == 1:
+        return [function(*arguments, 0, total, *tail)]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(
+            pool.map(
+                lambda span: function(*arguments, span[0], span[1], *tail),
+                _spans(total, workers),
+            )
+        )
+
+
+
+def _fan_out_scratch(
+    function, arguments, total: int, workers: int, scratch, tail
+) -> list:
+    """Like :func:`_fan_out`, but each span also gets its own scratch arrays."""
+
+    def run(item):
+        index, span = item
+        return function(
+            *arguments,
+            span[0],
+            span[1],
+            addr(scratch[0][index]),
+            addr(scratch[1][index]),
+            *tail,
+        )
+
+    if workers == 1:
+        return [run((0, (0, total)))]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(run, enumerate(_spans(total, workers))))
 
 
 def gram(factors: np.ndarray) -> np.ndarray:
@@ -167,22 +216,24 @@ def least_squares(
     )
     matrix_work = np.empty((workers, n_factors, n_factors), dtype=np.float64)
     vector_work = np.empty((workers, n_factors), dtype=np.float64)
-    failure_work = np.empty(workers, dtype=np.int64)
-    failed = lib().mi_least_squares(
-        addr(indptr),
-        addr(indices),
-        addr(data),
-        addr(result64),
-        addr(fixed),
-        addr(fixed_gram),
-        addr(matrix_work),
-        addr(vector_work),
-        addr(failure_work),
+    # Every worker needs its own Cholesky scratch, so the span index picks the
+    # slice rather than sharing one buffer across the pool.
+    failures = _fan_out_scratch(
+        lib().mi_least_squares_range,
+        (
+            addr(indptr),
+            addr(indices),
+            addr(data),
+            addr(result64),
+            addr(fixed),
+            addr(fixed_gram),
+        ),
         matrix.shape[0],
-        n_factors,
         workers,
-        regularization,
+        (matrix_work, vector_work),
+        (n_factors, regularization),
     )
+    failed = min((value for value in failures if value), default=0)
     if failed:
         raise ValueError(
             f"Cholesky factorization failed on row {failed - 1}; "
@@ -214,14 +265,18 @@ def score(
         result.size * queries.shape[1],
         num_threads,
     )
-    lib().mi_score(
-        addr(queries),
-        addr(candidates),
-        addr(ids),
-        addr(result),
-        queries.shape[0],
-        len(ids),
-        queries.shape[1],
+    _fan_out(
+        lib().mi_score_range,
+        (
+            addr(queries),
+            addr(candidates),
+            addr(ids),
+            addr(result),
+            len(ids),
+            queries.shape[1],
+        ),
+        result.size,
         workers,
+        (),
     )
     return result
